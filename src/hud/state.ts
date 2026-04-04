@@ -10,6 +10,7 @@ import { execSync } from 'child_process';
 import { join, dirname, basename } from 'path';
 import { fileURLToPath } from 'url';
 import { omxStateDir } from '../utils/paths.js';
+import { findGitLayout, readGitLayoutFile } from '../utils/git-layout.js';
 import { getDefaultBridge, isBridgeEnabled } from '../runtime/bridge.js';
 import type { RuntimeSnapshot } from '../runtime/bridge.js';
 import { getReadScopedStatePaths } from '../mcp/state-paths.js';
@@ -175,13 +176,70 @@ export function readVersion(): string | null {
 
 export type GitRunner = (cwd: string, args: string[]) => string | null;
 
+/**
+ * On Windows, read common git queries directly from .git/ files to avoid
+ * spawning console windows (conhost.exe flicker).  Falls back to execSync
+ * for non-Windows platforms or unrecognised arguments.
+ *
+ * See: https://github.com/Yeachan-Heo/oh-my-codex/issues/1100
+ */
 function runGit(cwd: string, args: string[]): string | null {
+  if (process.platform === 'win32') {
+    try {
+      const gitLayout = findGitLayout(cwd);
+      if (gitLayout) {
+        const cmd = args.join(' ');
+
+        if (cmd === 'rev-parse --abbrev-ref HEAD') {
+          const head = readGitLayoutFile(gitLayout.gitDir, 'HEAD');
+          if (head?.startsWith('ref: refs/heads/'))
+            return head.slice('ref: refs/heads/'.length);
+          return head; // detached HEAD — raw SHA
+        }
+
+        if (cmd.startsWith('remote get-url ')) {
+          const remoteName = args[2];
+          const config = readGitLayoutFile(gitLayout.gitDir, 'config')
+            ?? readGitLayoutFile(gitLayout.commonDir, 'config');
+          if (config) {
+            const re = new RegExp(
+              `\\[remote "${remoteName}"\\][\\s\\S]*?url\\s*=\\s*(.+)`,
+              'm',
+            );
+            const m = config.match(re);
+            if (m) return m[1].trim();
+          }
+          return null;
+        }
+
+        if (cmd === 'remote') {
+          const config = readGitLayoutFile(gitLayout.gitDir, 'config')
+            ?? readGitLayoutFile(gitLayout.commonDir, 'config');
+          if (config) {
+            const matches = [...config.matchAll(/\[remote "([^"]+)"\]/g)];
+            if (matches.length > 0) return matches.map((m) => m[1]).join('\n');
+          }
+          return null;
+        }
+
+        if (cmd === 'rev-parse --show-toplevel') {
+          return gitLayout.worktreeRoot;
+        }
+      }
+    } catch { /* fall through to execSync */ }
+  }
+
+  return runGitExec(cwd, args);
+}
+
+function runGitExec(cwd: string, args: string[]): string | null {
   try {
     return execSync(`git ${args.join(' ')}`, {
       cwd,
       encoding: 'utf-8',
       timeout: 2000,
       stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
     }).trim() || null;
   } catch {
     return null;
