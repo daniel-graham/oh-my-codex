@@ -1,11 +1,12 @@
 // @ts-nocheck
 import { appendFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'fs/promises';
-import { existsSync } from 'fs';
+import { appendFileSync, existsSync, mkdirSync } from 'fs';
 import { execFileSync } from 'child_process';
 import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'node:url';
 import { safeString } from './utils.js';
 import { resolveBridgeStateDir, resolveRuntimeBinaryPath } from '../../runtime/bridge.js';
+import { appendTeamDeliveryLog } from '../../team/delivery-log.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -26,7 +27,7 @@ import {
  * owned path.
  * Disable entirely with OMX_RUNTIME_BRIDGE=0.
  */
-function runtimeExec(command, stateDir) {
+function runtimeExec(command, stateDir, team) {
   if (process.env.OMX_RUNTIME_BRIDGE === '0') return;
   try {
     const binaryPath = resolveRuntimeBinaryPath();
@@ -35,8 +36,79 @@ function runtimeExec(command, stateDir) {
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
     });
-  } catch {
+  } catch (error) {
+    recordBridgeFallback({
+      stateDir,
+      team,
+      operation: 'runtimeExec',
+      fallbackTarget: 'js_state_mutation',
+      command: safeString(command?.command).trim() || 'unknown',
+      requestId: safeString(command?.request_id).trim() || undefined,
+      messageId: safeString(command?.message_id).trim() || undefined,
+      reason: bridgeErrorReason(error),
+    });
     // non-fatal: JS path is the fallback
+  }
+}
+
+function bridgeErrorReason(error) {
+  const err = error || {};
+  const stderr = safeString(err.stderr).trim();
+  if (stderr) return stderr.slice(0, 500);
+  const message = safeString(err.message).trim();
+  if (message) return message.slice(0, 500);
+  return 'unknown_bridge_error';
+}
+
+function bridgeFallbackLogPath(stateDir) {
+  return join(dirname(stateDir), 'logs', `team-dispatch-${new Date().toISOString().slice(0, 10)}.jsonl`);
+}
+
+function recordBridgeFallback({
+  stateDir,
+  team,
+  operation,
+  fallbackTarget,
+  command,
+  requestId,
+  messageId,
+  reason,
+}) {
+  const event = {
+    timestamp: new Date().toISOString(),
+    type: 'bridge_fallback',
+    source: 'notify-hook.team-dispatch',
+    fallback: true,
+    counter: 'team_dispatch_bridge_fallback_total',
+    bridge_operation: operation,
+    fallback_target: fallbackTarget,
+    team: safeString(team).trim() || null,
+    command: safeString(command).trim() || null,
+    request_id: safeString(requestId).trim() || null,
+    message_id: safeString(messageId).trim() || null,
+    reason: safeString(reason).trim() || 'unknown_bridge_fallback',
+  };
+  try {
+    const logPath = bridgeFallbackLogPath(stateDir);
+    mkdirSync(dirname(logPath), { recursive: true });
+    appendFileSync(logPath, `${JSON.stringify(event)}\n`);
+  } catch {
+    // best effort observability only
+  }
+  try {
+    appendTeamDeliveryLog(join(dirname(stateDir), 'logs'), {
+      event: 'bridge_fallback',
+      ...event,
+    }).catch(() => {});
+  } catch {
+    // best effort observability only
+  }
+  try {
+    process.emitWarning(`[omx] team-dispatch bridge fallback: ${event.bridge_operation} -> ${event.fallback_target}: ${event.reason}`, {
+      code: 'OMX_TEAM_DISPATCH_BRIDGE_FALLBACK',
+    });
+  } catch {
+    // best effort observability only
   }
 }
 
@@ -49,8 +121,29 @@ function readJson(path, fallback) {
 async function readBridgeDispatchRequests(stateDir, teamName) {
   const candidate = join(stateDir, 'dispatch.json');
   if (!existsSync(candidate)) return null;
-  const parsed = await readJson(candidate, null);
-  if (!parsed || !Array.isArray(parsed.records)) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(await readFile(candidate, 'utf8'));
+  } catch (error) {
+    recordBridgeFallback({
+      stateDir,
+      team: teamName,
+      operation: 'readBridgeDispatchRequests',
+      fallbackTarget: 'legacy_dispatch_requests',
+      reason: `parse_failed:${bridgeErrorReason(error)}`,
+    });
+    return null;
+  }
+  if (!parsed || !Array.isArray(parsed.records)) {
+    recordBridgeFallback({
+      stateDir,
+      team: teamName,
+      operation: 'readBridgeDispatchRequests',
+      fallbackTarget: 'legacy_dispatch_requests',
+      reason: 'invalid_dispatch_compat_schema',
+    });
+    return null;
+  }
   return parsed.records
     .map((record) => {
       if (!record || typeof record !== 'object') return null;
@@ -96,6 +189,7 @@ async function writeJsonAtomic(path, value) {
 
 // Keep stale-timeout semantics aligned with src/team/state.ts LOCK_STALE_MS.
 const DISPATCH_LOCK_STALE_MS = 5 * 60 * 1000;
+const DISPATCH_REQUEST_LEASE_STALE_MS = 30 * 1000;
 const DEFAULT_ISSUE_DISPATCH_COOLDOWN_MS = 15 * 60 * 1000;
 const ISSUE_DISPATCH_COOLDOWN_ENV = 'OMX_TEAM_DISPATCH_ISSUE_COOLDOWN_MS';
 const DEFAULT_DISPATCH_TRIGGER_COOLDOWN_MS = 30 * 1000;
@@ -116,6 +210,15 @@ async function emitOperationalHookEvent(cwd, eventName, context) {
   } catch {
     // best effort only
   }
+}
+
+function mapDispatchFailureToCanonicalEvent(reason) {
+  const normalized = safeString(reason).toLowerCase();
+  if (!normalized) return 'run.blocked_on_system';
+  if (normalized.includes('missing') || normalized.includes('deferred') || normalized.includes('rejected')) {
+    return 'run.blocked_on_user';
+  }
+  return 'run.blocked_on_system';
 }
 
 function resolveIssueDispatchCooldownMs(env = process.env) {
@@ -182,6 +285,31 @@ function parseTriggerCooldownEntry(entry) {
   };
 }
 
+function reserveDispatchCooldowns({
+  issueCooldownMs,
+  triggerCooldownMs,
+  issueCooldownByIssue,
+  triggerCooldownByKey,
+  issueKey,
+  triggerKey,
+  requestId,
+  reservedAt = Date.now(),
+}) {
+  let mutated = false;
+  if (issueKey && issueCooldownMs > 0) {
+    issueCooldownByIssue[issueKey] = reservedAt;
+    mutated = true;
+  }
+  if (triggerKey && triggerCooldownMs > 0) {
+    triggerCooldownByKey[triggerKey] = {
+      at: reservedAt,
+      last_request_id: safeString(requestId).trim(),
+    };
+    mutated = true;
+  }
+  return mutated;
+}
+
 async function withLockDirectory(lockDir, timeoutError, fn) {
   const ownerPath = join(lockDir, 'owner');
   const ownerToken = `${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}`;
@@ -242,6 +370,49 @@ async function withMailboxLock(teamDirPath, workerName, fn) {
     `Timed out acquiring mailbox lock for ${teamDirPath}/${workerName}`,
     fn,
   );
+}
+
+function dispatchRequestLeaseDir(teamDirPath, requestId) {
+  return join(teamDirPath, 'dispatch', `.processing-${safeString(requestId).trim()}`);
+}
+
+async function tryAcquireDispatchRequestLease(teamDirPath, requestId) {
+  const lockDir = dispatchRequestLeaseDir(teamDirPath, requestId);
+  const ownerPath = join(lockDir, 'owner');
+  const ownerToken = `${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}`;
+  await mkdir(dirname(lockDir), { recursive: true });
+
+  while (true) {
+    try {
+      await mkdir(lockDir, { recursive: false });
+      await writeFile(ownerPath, ownerToken, 'utf8');
+      return { lockDir, ownerPath, ownerToken, requestId };
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+      try {
+        const info = await stat(lockDir);
+        if (Date.now() - info.mtimeMs > DISPATCH_REQUEST_LEASE_STALE_MS) {
+          await rm(lockDir, { recursive: true, force: true });
+          continue;
+        }
+      } catch {
+        // best effort
+      }
+      return null;
+    }
+  }
+}
+
+async function releaseDispatchRequestLease(lease) {
+  if (!lease?.lockDir || !lease?.ownerPath || !lease?.ownerToken) return;
+  try {
+    const currentOwner = await readFile(lease.ownerPath, 'utf8');
+    if (currentOwner.trim() === lease.ownerToken) {
+      await rm(lease.lockDir, { recursive: true, force: true });
+    }
+  } catch {
+    // best effort
+  }
 }
 
 function resolveLeaderPaneId(config) {
@@ -335,6 +506,213 @@ async function appendLeaderNotificationDeferredEvent({
   await appendFile(eventsPath, JSON.stringify(event) + '\n').catch(() => {});
 }
 
+async function finalizeClaimedDispatchRequest({
+  claim,
+  result,
+  teamName,
+  teamDirPath,
+  config,
+  cwd,
+  stateDir,
+  logsDir,
+  issueCooldownMs,
+  triggerCooldownMs,
+}) {
+  const requestsPath = join(teamDirPath, 'dispatch', 'requests.json');
+  const issueKey = extractIssueKey(claim.request.trigger_message);
+  const triggerKey = normalizeTriggerKey(claim.request.trigger_message);
+  let summary = { processed: 0, skipped: 0, failed: 0 };
+
+  await withDispatchLock(teamDirPath, async () => {
+    const bridgeRequests = await readBridgeDispatchRequests(stateDir, teamName);
+    const usingLegacyRequests = bridgeRequests === null;
+    const requests = usingLegacyRequests ? await readJson(requestsPath, []) : bridgeRequests;
+    if (!Array.isArray(requests)) return;
+
+    const index = requests.findIndex((entry) => safeString(entry?.request_id).trim() === claim.request.request_id);
+    if (index < 0) return;
+
+    const request = requests[index];
+    if (!request || typeof request !== 'object' || shouldSkipRequest(request) || request.status !== 'pending') return;
+
+    const issueCooldownState = await readIssueCooldownState(teamDirPath);
+    const triggerCooldownState = await readTriggerCooldownState(teamDirPath);
+    const issueCooldownByIssue = issueCooldownState.by_issue || {};
+    const triggerCooldownByKey = triggerCooldownState.by_trigger || {};
+    const nowIso = new Date().toISOString();
+    let mutated = false;
+
+    mutated = reserveDispatchCooldowns({
+      issueCooldownMs,
+      triggerCooldownMs,
+      issueCooldownByIssue,
+      triggerCooldownByKey,
+      issueKey,
+      triggerKey,
+      requestId: request.request_id,
+    }) || mutated;
+
+    request.attempt_count = Number.isFinite(request.attempt_count) ? Math.max(0, request.attempt_count + 1) : 1;
+    request.updated_at = nowIso;
+
+    if (result.ok) {
+      const MAX_UNCONFIRMED_ATTEMPTS = 3;
+      if (result.reason === 'tmux_send_keys_unconfirmed' && request.attempt_count < MAX_UNCONFIRMED_ATTEMPTS) {
+        request.last_reason = result.reason;
+        summary.skipped += 1;
+        mutated = true;
+        await appendDispatchLog(logsDir, {
+          type: 'dispatch_unconfirmed_retry',
+          team: teamName,
+          request_id: request.request_id,
+          worker: request.to_worker,
+          attempt: request.attempt_count,
+          reason: result.reason,
+          ...buildDispatchAttemptEvidence(result),
+        });
+        await appendDeliveryTelemetry(logsDir, {
+          event: 'dispatch_result',
+          team: teamName,
+          request_id: request.request_id,
+          message_id: request.message_id || null,
+          to_worker: request.to_worker,
+          transport: 'send-keys',
+          result: 'retry',
+          reason: result.reason,
+        });
+        await emitOperationalHookEvent(cwd, 'retry-needed', {
+          team: teamName,
+          worker: request.to_worker,
+          request_id: request.request_id,
+          attempt: request.attempt_count,
+          command: request.trigger_message,
+          reason: result.reason,
+          status: 'retry-needed',
+        });
+      } else if (result.reason === 'tmux_send_keys_unconfirmed') {
+        request.status = 'failed';
+        request.failed_at = nowIso;
+        request.last_reason = 'unconfirmed_after_max_retries';
+        runtimeExec({ command: 'MarkFailed', request_id: request.request_id, reason: 'unconfirmed_after_max_retries' }, stateDir, teamName);
+        summary.processed += 1;
+        summary.failed += 1;
+        mutated = true;
+        await appendDispatchLog(logsDir, {
+          type: 'dispatch_failed',
+          team: teamName,
+          request_id: request.request_id,
+          worker: request.to_worker,
+          message_id: request.message_id || null,
+          reason: request.last_reason,
+          ...buildDispatchAttemptEvidence(result),
+        });
+        await appendDeliveryTelemetry(logsDir, {
+          event: 'dispatch_result',
+          team: teamName,
+          request_id: request.request_id,
+          message_id: request.message_id || null,
+          to_worker: request.to_worker,
+          transport: 'send-keys',
+          result: 'failed',
+          reason: request.last_reason,
+        });
+        await emitOperationalHookEvent(cwd, 'failed', {
+          team: teamName,
+          worker: request.to_worker,
+          request_id: request.request_id,
+          message_id: request.message_id || null,
+          command: request.trigger_message,
+          reason: request.last_reason,
+          error_summary: request.last_reason,
+          status: 'failed',
+        });
+      } else {
+        request.status = 'notified';
+        request.notified_at = nowIso;
+        request.last_reason = result.reason;
+        runtimeExec({ command: 'MarkNotified', request_id: request.request_id, channel: 'tmux' }, stateDir, teamName);
+        if (request.kind === 'mailbox' && request.message_id) {
+          runtimeExec({ command: 'MarkMailboxNotified', message_id: request.message_id }, stateDir, teamName);
+          if (usingLegacyRequests) {
+            await updateMailboxNotified(stateDir, teamName, request.to_worker, request.message_id).catch(() => {});
+          }
+        }
+        summary.processed += 1;
+        mutated = true;
+        await appendDispatchLog(logsDir, {
+          type: 'dispatch_notified',
+          team: teamName,
+          request_id: request.request_id,
+          worker: request.to_worker,
+          message_id: request.message_id || null,
+          reason: result.reason,
+          ...buildDispatchAttemptEvidence(result),
+        });
+        await appendDeliveryTelemetry(logsDir, {
+          event: 'dispatch_result',
+          team: teamName,
+          request_id: request.request_id,
+          message_id: request.message_id || null,
+          to_worker: request.to_worker,
+          transport: 'send-keys',
+          result: 'notified',
+          reason: result.reason,
+        });
+      }
+    } else {
+      request.status = 'failed';
+      request.failed_at = nowIso;
+      request.last_reason = result.reason;
+      runtimeExec({ command: 'MarkFailed', request_id: request.request_id, reason: result.reason }, stateDir, teamName);
+      summary.processed += 1;
+      summary.failed += 1;
+      mutated = true;
+      await appendDispatchLog(logsDir, {
+        type: 'dispatch_failed',
+        team: teamName,
+        request_id: request.request_id,
+        worker: request.to_worker,
+        message_id: request.message_id || null,
+        reason: result.reason,
+        ...buildDispatchAttemptEvidence(result),
+      });
+      await appendDeliveryTelemetry(logsDir, {
+        event: 'dispatch_result',
+        team: teamName,
+        request_id: request.request_id,
+        message_id: request.message_id || null,
+        to_worker: request.to_worker,
+        transport: 'send-keys',
+        result: 'failed',
+        reason: result.reason,
+      });
+      await emitOperationalHookEvent(cwd, result.reason === LEADER_PANE_MISSING_DEFERRED_REASON ? 'handoff-needed' : 'failed', {
+        team: teamName,
+        worker: request.to_worker,
+        request_id: request.request_id,
+        message_id: request.message_id || null,
+        command: request.trigger_message,
+        reason: result.reason,
+        ...(result.reason === LEADER_PANE_MISSING_DEFERRED_REASON
+          ? { status: 'handoff-needed' }
+          : { status: 'failed', error_summary: result.reason }),
+      });
+    }
+
+    if (!mutated) return;
+    issueCooldownState.by_issue = issueCooldownByIssue;
+    await writeJsonAtomic(issueCooldownStatePath(teamDirPath), issueCooldownState);
+    triggerCooldownState.by_trigger = triggerCooldownByKey;
+    await writeJsonAtomic(triggerCooldownStatePath(teamDirPath), triggerCooldownState);
+    await writeJsonAtomic(requestsPath, requests);
+    if (!usingLegacyRequests) {
+      await writeBridgeDispatchCompat(stateDir, teamName, requests);
+    }
+  });
+
+  return summary;
+}
+
 function resolveWorkerCliForRequest(request, config) {
   const workers = Array.isArray(config?.workers) ? config.workers : [];
   const idx = Number.isFinite(request?.worker_index) ? Number(request.worker_index) : null;
@@ -348,12 +726,14 @@ function resolveWorkerCliForRequest(request, config) {
 
 function capturedPaneContainsTrigger(captured, trigger) {
   if (!captured || !trigger) return false;
-  return normalizeTmuxCapture(captured).includes(normalizeTmuxCapture(trigger));
+  const normalizeForDraftMatch = (value) => normalizeTmuxCapture(value).replace(/-\s+/g, '-');
+  return normalizeForDraftMatch(captured).includes(normalizeForDraftMatch(trigger));
 }
 
 function capturedPaneContainsTriggerNearTail(captured, trigger, nonEmptyTailLines = 24) {
   if (!captured || !trigger) return false;
-  const normalizedTrigger = normalizeTmuxCapture(trigger);
+  const normalizeForDraftMatch = (value) => normalizeTmuxCapture(value).replace(/-\s+/g, '-');
+  const normalizedTrigger = normalizeForDraftMatch(trigger);
   if (!normalizedTrigger) return false;
   const lines = safeString(captured)
     .split('\n')
@@ -361,7 +741,13 @@ function capturedPaneContainsTriggerNearTail(captured, trigger, nonEmptyTailLine
     .filter((line) => line.length > 0);
   if (lines.length === 0) return false;
   const tail = lines.slice(-Math.max(1, nonEmptyTailLines)).join(' ');
-  return normalizeTmuxCapture(tail).includes(normalizedTrigger);
+  return normalizeForDraftMatch(tail).includes(normalizedTrigger);
+}
+
+function buildJoinedCapturePaneArgv(paneTarget, tailLines = 80) {
+  // Join wrapped visual lines so long path-like trigger text split by tmux
+  // remains comparable with the original trigger.
+  return ['capture-pane', '-J', '-t', paneTarget, '-p', '-S', `-${tailLines}`];
 }
 
 const INJECT_VERIFY_DELAY_MS = 250;
@@ -372,6 +758,7 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
   if (!target) {
     return { ok: false, reason: 'missing_tmux_target' };
   }
+  const leaderTargeted = request.to_worker === 'leader-fixed';
   let resolution;
   if (target.type === 'session') {
     const paneId = await resolveSessionToPane(target.value).catch(() => null);
@@ -384,14 +771,24 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
   if (!resolution.paneTarget) {
     return { ok: false, reason: `target_resolution_failed:${resolution.reason}` };
   }
+  const isLeaderMailboxDispatch = request.to_worker === 'leader-fixed';
   const paneGuard = await evaluatePaneInjectionReadiness(resolution.paneTarget, {
     skipIfScrolling: true,
-    requireRunningAgent: false,
+    requireRunningAgent: leaderTargeted,
     requireReady: false,
     requireIdle: false,
+    requireObservableState: leaderTargeted,
   });
   if (!paneGuard.ok) {
-    return { ok: false, reason: paneGuard.reason };
+    return {
+      ok: false,
+      reason: paneGuard.reason,
+      pane: resolution.paneTarget,
+      pane_source: resolution.source || null,
+      readiness_evidence: paneGuard.readinessEvidence || null,
+      pane_current_command: paneGuard.paneCurrentCommand || null,
+      tmux_injection_attempted: false,
+    };
   }
 
   const attemptCountAtStart = Number.isFinite(request.attempt_count)
@@ -402,7 +799,7 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
   if (attemptCountAtStart >= 1) {
     try {
       // Narrow capture (8 lines) to scope check to input area, not scrollback output
-      const preCapture = await runProcess('tmux', buildCapturePaneArgv(resolution.paneTarget, 8), 2000);
+      const preCapture = await runProcess('tmux', buildJoinedCapturePaneArgv(resolution.paneTarget, 8), 2000);
       preCaptureHasTrigger = capturedPaneContainsTrigger(preCapture.stdout, request.trigger_message);
     } catch {
       preCaptureHasTrigger = false;
@@ -425,16 +822,25 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
     prompt: request.trigger_message,
     submitKeyPresses,
     typePrompt: shouldTypePrompt,
+    queueFirstSubmit: leaderTargeted,
   });
   if (!sendResult.ok) {
-    return { ok: false, reason: sendResult.error || sendResult.reason };
+    return {
+      ok: false,
+      reason: sendResult.error || sendResult.reason,
+      pane: resolution.paneTarget,
+      pane_source: resolution.source || null,
+      readiness_evidence: paneGuard.readinessEvidence || null,
+      pane_current_command: paneGuard.paneCurrentCommand || null,
+      tmux_injection_attempted: true,
+    };
   }
 
   // Post-injection verification: confirm the trigger text was consumed.
   // Fixes #391: without this, dispatch marks 'notified' even when the worker
   // pane is sitting on an unsent draft (C-m was not effectively applied).
-  const verifyNarrowArgv = buildCapturePaneArgv(resolution.paneTarget, 8);
-  const verifyWideArgv = buildCapturePaneArgv(resolution.paneTarget);
+  const verifyNarrowArgv = buildJoinedCapturePaneArgv(resolution.paneTarget, 8);
+  const verifyWideArgv = buildJoinedCapturePaneArgv(resolution.paneTarget);
   for (let round = 0; round < INJECT_VERIFY_ROUNDS; round++) {
     await new Promise((r) => setTimeout(r, INJECT_VERIFY_DELAY_MS));
     try {
@@ -445,23 +851,52 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
       // full-scrollback false positives.
       const narrowCap = await runProcess('tmux', verifyNarrowArgv, 2000);
       const wideCap = await runProcess('tmux', verifyWideArgv, 2000);
-      // Worker is actively processing (mirrors sync path tmux-session.ts:1292-1294)
-      if (paneHasActiveTask(wideCap.stdout)) {
-        runtimeExec({ command: 'MarkDelivered', request_id: request.request_id }, stateDir);
-        return { ok: true, reason: 'tmux_send_keys_confirmed_active_task', pane: resolution.paneTarget };
-      }
-      // Do not declare success while a *worker* pane is still bootstrapping / not
-      // input-ready. Otherwise a pre-ready send can be marked "confirmed" and later
-      // appear as a stuck unsent draft once the UI finishes loading.
-      // Keep leader-fixed behavior unchanged to avoid regressing leader notification flow.
-      if (request.to_worker !== 'leader-fixed' && !paneLooksReady(wideCap.stdout)) {
-        continue;
-      }
       const triggerInNarrow = capturedPaneContainsTrigger(narrowCap.stdout, request.trigger_message);
       const triggerNearTail = capturedPaneContainsTriggerNearTail(wideCap.stdout, request.trigger_message);
+      if (triggerInNarrow || triggerNearTail) {
+        // Draft is still visible, so C-m has not actually submitted it yet.
+        // Do not let transient spinner/active-task text mask an unsent draft.
+        await sendPaneInput({
+          paneTarget: resolution.paneTarget,
+          prompt: request.trigger_message,
+          submitKeyPresses,
+          typePrompt: false,
+        }).catch(() => {});
+        continue;
+      }
+      // Worker is actively processing (mirrors sync path tmux-session.ts:1292-1294)
+      if (paneHasActiveTask(wideCap.stdout)) {
+        runtimeExec({ command: 'MarkDelivered', request_id: request.request_id }, stateDir, request.team_name);
+        return {
+          ok: true,
+          reason: 'tmux_send_keys_confirmed_active_task',
+          pane: resolution.paneTarget,
+          pane_source: resolution.source || null,
+          readiness_evidence: paneGuard.readinessEvidence || null,
+          pane_current_command: paneGuard.paneCurrentCommand || null,
+          tmux_injection_attempted: true,
+        };
+      }
+      // Do not declare success while a pane is not input-ready. Otherwise a
+      // pre-ready send can be marked "confirmed" and later appear as a stuck
+      // unsent draft once the UI finishes loading. This includes leader-fixed:
+      // its Codex UI can show "tab to queue message" while busy, and marking
+      // delivered before queue/consumption confirmation loses the orchestration
+      // nudge until a human presses Tab manually.
+      if (!paneLooksReady(wideCap.stdout)) {
+        continue;
+      }
       if (!triggerInNarrow && !triggerNearTail) {
-        runtimeExec({ command: 'MarkDelivered', request_id: request.request_id }, stateDir);
-        return { ok: true, reason: 'tmux_send_keys_confirmed', pane: resolution.paneTarget };
+        runtimeExec({ command: 'MarkDelivered', request_id: request.request_id }, stateDir, request.team_name);
+        return {
+          ok: true,
+          reason: 'tmux_send_keys_confirmed',
+          pane: resolution.paneTarget,
+          pane_source: resolution.source || null,
+          readiness_evidence: paneGuard.readinessEvidence || null,
+          pane_current_command: paneGuard.paneCurrentCommand || null,
+          tmux_injection_attempted: true,
+        };
       }
     } catch {
       // capture failed; fall through to retry C-m
@@ -472,11 +907,20 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
       prompt: request.trigger_message,
       submitKeyPresses,
       typePrompt: false,
+      queueFirstSubmit: leaderTargeted,
     }).catch(() => {});
   }
 
   // Trigger text is still visible after all retry rounds.
-  return { ok: true, reason: 'tmux_send_keys_unconfirmed', pane: resolution.paneTarget };
+  return {
+    ok: true,
+    reason: 'tmux_send_keys_unconfirmed',
+    pane: resolution.paneTarget,
+    pane_source: resolution.source || null,
+    readiness_evidence: paneGuard.readinessEvidence || null,
+    pane_current_command: paneGuard.paneCurrentCommand || null,
+    tmux_injection_attempted: true,
+  };
 }
 
 function shouldSkipRequest(request) {
@@ -505,12 +949,38 @@ async function appendDispatchLog(logsDir, event) {
   await appendFile(path, `${JSON.stringify({ timestamp: new Date().toISOString(), ...event })}\n`).catch(() => {});
 }
 
+async function appendDeliveryTelemetry(logsDir, event) {
+  await appendTeamDeliveryLog(logsDir, {
+    source: 'notify-hook.team-dispatch',
+    ...event,
+  }).catch(() => {});
+}
+
+function buildDispatchAttemptEvidence(result, fallback = {}) {
+  return {
+    pane_target: safeString(result?.pane || fallback.pane || '').trim() || null,
+    pane_source: safeString(result?.pane_source || fallback.pane_source || '').trim() || null,
+    readiness_evidence: safeString(result?.readiness_evidence || fallback.readiness_evidence || '').trim() || null,
+    pane_current_command: safeString(result?.pane_current_command || fallback.pane_current_command || '').trim() || null,
+    tmux_injection_attempted:
+      typeof result?.tmux_injection_attempted === 'boolean'
+        ? result.tmux_injection_attempted
+        : (typeof fallback.tmux_injection_attempted === 'boolean' ? fallback.tmux_injection_attempted : null),
+  };
+}
+
 export async function drainPendingTeamDispatch({
   cwd,
   stateDir = resolveBridgeStateDir(cwd),
   logsDir = join(cwd, '.omx', 'logs'),
   maxPerTick = 5,
   injector = injectDispatchRequest,
+}: {
+  cwd?: string;
+  stateDir?: string;
+  logsDir?: string;
+  maxPerTick?: number;
+  injector?: typeof injectDispatchRequest;
 } = {}) {
   if (safeString(process.env.OMX_TEAM_WORKER)) {
     return { processed: 0, skipped: 0, failed: 0, reason: 'worker_context' };
@@ -532,8 +1002,8 @@ export async function drainPendingTeamDispatch({
     const manifestPath = join(teamDirPath, 'manifest.v2.json');
     const configPath = join(teamDirPath, 'config.json');
     const requestsPath = join(teamDirPath, 'dispatch', 'requests.json');
-
     const config = await readJson(existsSync(manifestPath) ? manifestPath : configPath, {});
+    const claims = [];
     await withDispatchLock(teamDirPath, async () => {
       const bridgeRequests = await readBridgeDispatchRequests(stateDir, teamName);
       const usingLegacyRequests = bridgeRequests === null;
@@ -547,7 +1017,7 @@ export async function drainPendingTeamDispatch({
 
       let mutated = false;
       for (const request of requests) {
-        if (processed >= maxPerTick) break;
+        if (processed + claims.length >= maxPerTick) break;
         if (!request || typeof request !== 'object') continue;
         if (shouldSkipRequest(request)) {
           skipped += 1;
@@ -575,10 +1045,21 @@ export async function drainPendingTeamDispatch({
               tmux_session: safeString(config?.tmux_session).trim() || null,
               leader_pane_id: safeString(config?.leader_pane_id).trim() || null,
               tmux_injection_attempted: false,
+              pane_target: null,
+              pane_source: null,
+              readiness_evidence: null,
+              pane_current_command: null,
             });
-            // On the legacy fallback lane, requests.json still carries the queue
-            // state for this deferred request; this event stays a progress
-            // artifact for hook/watcher readers.
+            await appendDeliveryTelemetry(logsDir, {
+              event: 'dispatch_result',
+              team: teamName,
+              request_id: request.request_id,
+              message_id: request.message_id || null,
+              to_worker: request.to_worker,
+              transport: 'send-keys',
+              result: 'deferred',
+              reason: LEADER_PANE_MISSING_DEFERRED_REASON,
+            });
             await appendLeaderNotificationDeferredEvent({
               stateDir,
               teamName,
@@ -613,126 +1094,24 @@ export async function drainPendingTeamDispatch({
           }
         }
 
-        const result = await injector(request, config, resolve(cwd), stateDir);
-        if (issueKey && issueCooldownMs > 0) {
-          issueCooldownByIssue[issueKey] = Date.now();
-          mutated = true;
+        const lease = await tryAcquireDispatchRequestLease(teamDirPath, request.request_id);
+        if (!lease) {
+          skipped += 1;
+          continue;
         }
-        if (triggerKey && triggerCooldownMs > 0) {
-          triggerCooldownByKey[triggerKey] = {
-            at: Date.now(),
-            last_request_id: safeString(request.request_id).trim(),
-          };
-          mutated = true;
-        }
-        const nowIso = new Date().toISOString();
-        request.attempt_count = Number.isFinite(request.attempt_count) ? Math.max(0, request.attempt_count + 1) : 1;
-        request.updated_at = nowIso;
-
-        if (result.ok) {
-          // Unconfirmed sends: trigger text was still visible after retry
-          // rounds. Leave as pending for the next tick to retry (up to 3
-          // total attempts) rather than marking notified. Fixes #391.
-          const MAX_UNCONFIRMED_ATTEMPTS = 3;
-          if (result.reason === 'tmux_send_keys_unconfirmed' && request.attempt_count < MAX_UNCONFIRMED_ATTEMPTS) {
-            request.last_reason = result.reason;
-            mutated = true;
-            skipped += 1;
-            await appendDispatchLog(logsDir, {
-              type: 'dispatch_unconfirmed_retry',
-              team: teamName,
-              request_id: request.request_id,
-              worker: request.to_worker,
-              attempt: request.attempt_count,
-              reason: result.reason,
-            });
-            await emitOperationalHookEvent(cwd, 'retry-needed', {
-              team: teamName,
-              worker: request.to_worker,
-              request_id: request.request_id,
-              attempt: request.attempt_count,
-              command: request.trigger_message,
-              reason: result.reason,
-              status: 'retry-needed',
-            });
-            continue;
-          }
-          if (result.reason === 'tmux_send_keys_unconfirmed') {
-            request.status = 'failed';
-            request.failed_at = nowIso;
-            request.last_reason = 'unconfirmed_after_max_retries';
-            runtimeExec({ command: 'MarkFailed', request_id: request.request_id, reason: 'unconfirmed_after_max_retries' }, stateDir);
-            processed += 1;
-            failed += 1;
-            mutated = true;
-            await appendDispatchLog(logsDir, {
-              type: 'dispatch_failed',
-              team: teamName,
-              request_id: request.request_id,
-              worker: request.to_worker,
-              message_id: request.message_id || null,
-              reason: request.last_reason,
-            });
-            await emitOperationalHookEvent(cwd, 'failed', {
-              team: teamName,
-              worker: request.to_worker,
-              request_id: request.request_id,
-              message_id: request.message_id || null,
-              command: request.trigger_message,
-              reason: request.last_reason,
-              error_summary: request.last_reason,
-              status: 'failed',
-            });
-            continue;
-          }
-          request.status = 'notified';
-          request.notified_at = nowIso;
-          request.last_reason = result.reason;
-          runtimeExec({ command: 'MarkNotified', request_id: request.request_id, channel: 'tmux' }, stateDir);
-          if (request.kind === 'mailbox' && request.message_id) {
-            runtimeExec({ command: 'MarkMailboxNotified', message_id: request.message_id }, stateDir);
-            if (usingLegacyRequests) {
-              await updateMailboxNotified(stateDir, teamName, request.to_worker, request.message_id).catch(() => {});
-            }
-          }
-          processed += 1;
-          mutated = true;
-          await appendDispatchLog(logsDir, {
-            type: 'dispatch_notified',
-            team: teamName,
-            request_id: request.request_id,
-            worker: request.to_worker,
-            message_id: request.message_id || null,
-            reason: result.reason,
-          });
-        } else {
-          request.status = 'failed';
-          request.failed_at = nowIso;
-          request.last_reason = result.reason;
-          runtimeExec({ command: 'MarkFailed', request_id: request.request_id, reason: result.reason }, stateDir);
-          processed += 1;
-          failed += 1;
-          mutated = true;
-          await appendDispatchLog(logsDir, {
-            type: 'dispatch_failed',
-            team: teamName,
-            request_id: request.request_id,
-            worker: request.to_worker,
-            message_id: request.message_id || null,
-            reason: result.reason,
-          });
-          await emitOperationalHookEvent(cwd, result.reason === LEADER_PANE_MISSING_DEFERRED_REASON ? 'handoff-needed' : 'failed', {
-            team: teamName,
-            worker: request.to_worker,
-            request_id: request.request_id,
-            message_id: request.message_id || null,
-            command: request.trigger_message,
-            reason: result.reason,
-            ...(result.reason === LEADER_PANE_MISSING_DEFERRED_REASON
-              ? { status: 'handoff-needed' }
-              : { status: 'failed', error_summary: result.reason }),
-          });
-        }
+        mutated = reserveDispatchCooldowns({
+          issueCooldownMs,
+          triggerCooldownMs,
+          issueCooldownByIssue,
+          triggerCooldownByKey,
+          issueKey,
+          triggerKey,
+          requestId: request.request_id,
+        }) || mutated;
+        claims.push({
+          request: { ...request },
+          lease,
+        });
       }
 
       if (mutated) {
@@ -746,6 +1125,37 @@ export async function drainPendingTeamDispatch({
         }
       }
     });
+
+    try {
+      for (const claim of claims) {
+        try {
+          const result = await injector(claim.request, config, resolve(cwd), stateDir);
+          const delta = await finalizeClaimedDispatchRequest({
+            claim,
+            result,
+            teamName,
+            teamDirPath,
+            config,
+            cwd,
+            stateDir,
+            logsDir,
+            issueCooldownMs,
+            triggerCooldownMs,
+          });
+          processed += delta.processed;
+          skipped += delta.skipped;
+          failed += delta.failed;
+        } finally {
+          claim.released = true;
+          await releaseDispatchRequestLease(claim.lease);
+        }
+      }
+    } finally {
+      for (const claim of claims) {
+        if (claim.released) continue;
+        await releaseDispatchRequestLease(claim.lease);
+      }
+    }
   }
 
   return { processed, skipped, failed };

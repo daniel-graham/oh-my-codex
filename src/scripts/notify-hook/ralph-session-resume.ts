@@ -6,7 +6,8 @@ import { resolveCodexPane } from '../tmux-hook-engine.js';
 import { safeString } from './utils.js';
 
 const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
-const RALPH_TERMINAL_PHASES = new Set(['complete', 'failed', 'cancelled']);
+const RALPH_TERMINAL_PHASES = new Set(['blocked_on_user', 'complete', 'failed', 'cancelled', 'interrupted']);
+const DEFAULT_RALPH_ACTIVE_STATE_STALE_MS = 24 * 60 * 60 * 1000;
 const RALPH_RESUME_LOCK_STALE_MS = 10_000;
 const RALPH_RESUME_LOCK_TIMEOUT_MS = 5_000;
 const RALPH_RESUME_LOCK_RETRY_MS = 25;
@@ -37,6 +38,14 @@ interface RalphStateCandidate {
   sessionId: string;
   path: string;
   state: Record<string, unknown>;
+}
+
+interface RalphStateFreshness {
+  stale: boolean;
+  ageMs: number;
+  checkedAtMs: number;
+  staleThresholdMs: number;
+  timestampSource: string;
 }
 
 function lockOwnerToken(): string {
@@ -127,8 +136,95 @@ function isActiveRalphCandidate(state: Record<string, unknown> | null): state is
   return state.active === true && !isTerminalRalphPhase(state.current_phase);
 }
 
-async function readCurrentOmxSessionId(stateDir: string): Promise<string> {
+function parsePositiveInteger(value: unknown): number | null {
+  const parsed = Number.parseInt(safeString(value).trim(), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function resolveActiveStateStaleThresholdMs(env: NodeJS.ProcessEnv = process.env): number {
+  return parsePositiveInteger(env.OMX_RALPH_ACTIVE_STATE_STALE_MS)
+    ?? parsePositiveInteger(env.OMX_RALPH_RESUME_STALE_MS)
+    ?? DEFAULT_RALPH_ACTIVE_STATE_STALE_MS;
+}
+
+function parseTimestampMs(value: unknown): number | null {
+  const raw = safeString(value).trim();
+  if (!raw) return null;
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function stateActivityTimestampMs(state: Record<string, unknown>): { ms: number; source: string } | null {
+  let newest: { ms: number; source: string } | null = null;
+  for (const key of ['updated_at', 'last_turn_at', 'tmux_pane_set_at']) {
+    const ms = parseTimestampMs(state[key]);
+    if (ms !== null && (!newest || ms > newest.ms)) {
+      newest = { ms, source: key };
+    }
+  }
+  return newest;
+}
+
+async function readRalphStateFreshness(
+  path: string,
+  state: Record<string, unknown>,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<RalphStateFreshness> {
+  const checkedAtMs = Date.now();
+  const threshold = resolveActiveStateStaleThresholdMs(env);
+  let timestamp = stateActivityTimestampMs(state);
+  if (!timestamp) {
+    try {
+      const info = await stat(path);
+      timestamp = { ms: info.mtimeMs, source: 'mtime' };
+    } catch {
+      timestamp = { ms: checkedAtMs, source: 'missing_mtime' };
+    }
+  }
+  const ageMs = Math.max(0, checkedAtMs - timestamp.ms);
+  return {
+    stale: ageMs > threshold,
+    ageMs,
+    checkedAtMs,
+    staleThresholdMs: threshold,
+    timestampSource: timestamp.source,
+  };
+}
+
+async function markRalphStateAbandoned(
+  path: string,
+  state: Record<string, unknown>,
+  freshness: RalphStateFreshness,
+): Promise<void> {
+  const nowIso = new Date(freshness.checkedAtMs).toISOString();
+  await writeJsonAtomic(path, {
+    ...state,
+    active: false,
+    current_phase: 'cancelled',
+    completed_at: nowIso,
+    abandoned_at: nowIso,
+    stop_reason: 'stale_active_state',
+    stale_resume_age_ms: freshness.ageMs,
+    stale_resume_threshold_ms: freshness.staleThresholdMs,
+    stale_resume_timestamp_source: freshness.timestampSource,
+  });
+}
+
+function readSessionIdFromEnvironment(env: NodeJS.ProcessEnv = process.env): string {
+  const candidates = [env.OMX_SESSION_ID, env.CODEX_SESSION_ID, env.SESSION_ID];
+  for (const candidate of candidates) {
+    const sessionId = safeString(candidate).trim();
+    if (SESSION_ID_PATTERN.test(sessionId)) return sessionId;
+  }
+  return '';
+}
+
+async function readCurrentOmxSessionId(stateDir: string, env: NodeJS.ProcessEnv = process.env): Promise<string> {
+  const envSessionId = readSessionIdFromEnvironment(env);
+  if (envSessionId) return envSessionId;
+
   const session = await readJson(join(stateDir, 'session.json'));
+  if (!session || typeof session !== 'object') return '';
   const sessionId = safeString(session?.session_id).trim();
   return SESSION_ID_PATTERN.test(sessionId) ? sessionId : '';
 }
@@ -155,12 +251,14 @@ async function scanMatchingRalphCandidates(
   currentOmxSessionId: string,
   payloadSessionId: string,
   payloadThreadId: string,
-): Promise<RalphStateCandidate[]> {
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<{ candidates: RalphStateCandidate[]; abandonedCount: number }> {
   const sessionsRoot = join(stateDir, 'sessions');
-  if (!existsSync(sessionsRoot)) return [];
+  if (!existsSync(sessionsRoot)) return { candidates: [], abandonedCount: 0 };
 
   const entries = await readdir(sessionsRoot, { withFileTypes: true }).catch(() => []);
   const matches: RalphStateCandidate[] = [];
+  let abandonedCount = 0;
   for (const entry of entries) {
     if (!entry.isDirectory() || !SESSION_ID_PATTERN.test(entry.name) || entry.name === currentOmxSessionId) continue;
     const path = join(sessionsRoot, entry.name, 'ralph-state.json');
@@ -174,13 +272,19 @@ async function scanMatchingRalphCandidates(
     } else if (!payloadThreadId || !ownerThreadId || ownerThreadId !== payloadThreadId) {
       continue;
     }
+    const freshness = await readRalphStateFreshness(path, state, env);
+    if (freshness.stale) {
+      await markRalphStateAbandoned(path, state, freshness);
+      abandonedCount += 1;
+      continue;
+    }
     matches.push({
       sessionId: entry.name,
       path,
       state,
     });
   }
-  return matches;
+  return { candidates: matches, abandonedCount };
 }
 
 export async function reconcileRalphSessionResume({
@@ -193,7 +297,7 @@ export async function reconcileRalphSessionResume({
   const lockedResult = await withRalphResumeLock(stateDir, async () => {
     await hooks?.afterLockAcquired?.();
 
-    const currentOmxSessionId = await readCurrentOmxSessionId(stateDir);
+    const currentOmxSessionId = await readCurrentOmxSessionId(stateDir, env);
     if (!currentOmxSessionId) {
       return {
         currentOmxSessionId: '',
@@ -212,14 +316,35 @@ export async function reconcileRalphSessionResume({
     const nowIso = new Date().toISOString();
 
     if (currentRalphState && currentRalphState.active === true) {
+      const freshness = await readRalphStateFreshness(currentRalphPath, currentRalphState, env);
+      if (freshness.stale) {
+        await markRalphStateAbandoned(currentRalphPath, currentRalphState, freshness);
+        return {
+          currentOmxSessionId,
+          resumed: false,
+          updatedCurrentOwner: false,
+          reason: 'current_ralph_abandoned_stale',
+          targetPath: currentRalphPath,
+        };
+      }
+
       let changed = false;
       const updated: Record<string, unknown> = { ...currentRalphState };
+      const normalizedPayloadThreadId = safeString(payloadThreadId).trim();
       if (safeString(updated.owner_omx_session_id).trim() !== currentOmxSessionId) {
         updated.owner_omx_session_id = currentOmxSessionId;
         changed = true;
       }
       if (payloadSessionId && !safeString(updated.owner_codex_session_id).trim()) {
         updated.owner_codex_session_id = payloadSessionId;
+        changed = true;
+      }
+      if (
+        !safeString(updated.owner_codex_session_id).trim()
+        && normalizedPayloadThreadId
+        && safeString(updated.owner_codex_thread_id).trim() !== normalizedPayloadThreadId
+      ) {
+        updated.owner_codex_thread_id = normalizedPayloadThreadId;
         changed = true;
       }
       if (
@@ -268,18 +393,21 @@ export async function reconcileRalphSessionResume({
       };
     }
 
-    const candidates = await scanMatchingRalphCandidates(
+    const { candidates, abandonedCount } = await scanMatchingRalphCandidates(
       stateDir,
       currentOmxSessionId,
       normalizedPayloadSessionId,
       normalizedPayloadThreadId,
+      env,
     );
     if (candidates.length !== 1) {
       return {
         currentOmxSessionId,
         resumed: false,
         updatedCurrentOwner: false,
-        reason: candidates.length === 0 ? 'no_matching_prior_ralph' : 'multiple_matching_prior_ralphs',
+        reason: candidates.length === 0
+          ? (abandonedCount > 0 ? 'matching_prior_ralph_abandoned_stale' : 'no_matching_prior_ralph')
+          : 'multiple_matching_prior_ralphs',
       };
     }
 

@@ -42,8 +42,10 @@ import {
   markDispatchRequestDelivered,
   transitionDispatchRequest,
   readDispatchRequest,
+  readMonitorSnapshot,
   resolveDispatchLockTimeoutMs,
 } from '../state.js';
+import { normalizeDispatchRequest } from '../state/dispatch.js';
 
 const ORIGINAL_OMX_TEAM_STATE_ROOT = process.env.OMX_TEAM_STATE_ROOT;
 
@@ -315,6 +317,7 @@ describe('team state', () => {
       policy.delegation_only = true;
       policy.nested_teams_allowed = true;
       policy.cleanup_requires_all_workers_inactive = false;
+      policy.team_decomposition = { decomposition_source: 'dag_sidecar' };
       manifest.policy = policy;
       delete manifest.governance;
       await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
@@ -328,6 +331,8 @@ describe('team state', () => {
       assert.equal('delegation_only' in (loaded?.policy ?? {}), false);
       assert.equal('nested_teams_allowed' in (loaded?.policy ?? {}), false);
       assert.equal('cleanup_requires_all_workers_inactive' in (loaded?.policy ?? {}), false);
+      assert.equal('team_decomposition' in (loaded?.policy ?? {}), false);
+      assert.deepEqual(loaded?.team_decomposition, { decomposition_source: 'dag_sidecar' });
 
       const freshCwd = await mkdtemp(join(tmpdir(), 'omx-team-manifest-policy-default-'));
       try {
@@ -384,6 +389,7 @@ exit 1
           kind: 'inbox',
           to_worker: 'worker-1',
           trigger_message: 'ping',
+          intent: 'followup-relaunch',
         },
         cwd,
       );
@@ -394,8 +400,9 @@ exit 1
       const jsonStart = queueLine.indexOf('{');
       const stateDirFlag = queueLine.lastIndexOf(' --state-dir=');
       const jsonPayload = stateDirFlag > jsonStart ? queueLine.slice(jsonStart, stateDirFlag) : queueLine.slice(jsonStart);
-      const payload = JSON.parse(jsonPayload) as { request_id: string };
+      const payload = JSON.parse(jsonPayload) as { request_id: string; metadata?: { intent?: string } };
       assert.equal(payload.request_id, queued.request.request_id);
+      assert.equal(payload.metadata?.intent, 'followup-relaunch');
     } finally {
       if (typeof previousRuntimeBinary === 'string') process.env.OMX_RUNTIME_BINARY = previousRuntimeBinary;
       else delete process.env.OMX_RUNTIME_BINARY;
@@ -414,6 +421,7 @@ exit 1
           to_worker: 'worker-1',
           message_id: 'msg-1',
           trigger_message: 'check mailbox',
+          intent: 'pending-mailbox-review',
         },
         cwd,
       );
@@ -441,6 +449,7 @@ exit 1
       const listed = await listDispatchRequests('team-dispatch', cwd);
       assert.equal(listed.length, 1);
       assert.equal(listed[0]?.message_id, 'msg-1');
+      assert.equal(listed[0]?.intent, 'pending-mailbox-review');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -491,7 +500,7 @@ exit 1
     }
   });
 
-  it('dispatch request store allows failed reason patches and fallback recovery to notified', async () => {
+  it('dispatch request store keeps failed requests failed while allowing reason patches', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-dispatch-store-failed-'));
     try {
       await initTeamState('team-dispatch-failed', 't', 'executor', 1, cwd);
@@ -519,22 +528,21 @@ exit 1
         { last_reason: 'fallback_confirmed:tmux_send_keys_sent', failed_at: undefined },
         cwd,
       );
-      assert.equal(recovered?.status, 'notified');
-      assert.equal(recovered?.last_reason, 'fallback_confirmed:tmux_send_keys_sent');
-      assert.equal(recovered?.failed_at, undefined);
+      assert.equal(recovered, null);
 
       const patched = await transitionDispatchRequest(
         'team-dispatch-failed',
         queued.request.request_id,
-        'notified',
-        'notified',
+        'failed',
+        'failed',
         { last_reason: 'fallback_confirmed_after_failed_receipt:tmux_send_keys_sent' },
         cwd,
       );
-      assert.equal(patched?.status, 'notified');
+      assert.equal(patched?.status, 'failed');
       assert.equal(patched?.last_reason, 'fallback_confirmed_after_failed_receipt:tmux_send_keys_sent');
       const reread = await readDispatchRequest('team-dispatch-failed', queued.request.request_id, cwd);
-      assert.equal(reread?.status, 'notified');
+      assert.equal(reread?.status, 'failed');
+      assert.equal(reread?.failed_at, patched?.failed_at);
       assert.equal(reread?.last_reason, 'fallback_confirmed_after_failed_receipt:tmux_send_keys_sent');
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -748,6 +756,21 @@ exit 1
       const t = await createTask('team-owner-write-fail', { subject: 'a', description: 'd', status: 'pending' }, cwd);
 
       previousUmask = process.umask(0o222);
+      const probeDir = join(cwd, 'claim-lock-permission-probe');
+      await mkdir(probeDir);
+      try {
+        await writeFile(join(probeDir, 'owner'), 'probe');
+        // Root and some permissive filesystems can still write through the
+        // umask-created non-writable directory, so this failure mode cannot be
+        // exercised deterministically in that environment.
+        return;
+      } catch {
+        // Expected on normal non-root POSIX filesystems; continue with the
+        // claim-lock cleanup assertion below.
+      } finally {
+        await rm(probeDir, { recursive: true, force: true });
+      }
+
       await assert.rejects(
         () => claimTask('team-owner-write-fail', t.id, 'worker-1', t.version ?? 1, cwd),
         /(EACCES|EPERM|permission denied)/i,
@@ -901,6 +924,254 @@ exit 1
       const content = await readFile(eventsPath, 'utf-8');
       assert.match(content, /\"type\":\"task_completed\"/);
       assert.match(content, new RegExp(`\"task_id\":\"${t.id}\"`));
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('transitionTaskStatus rejects broad delegated completion without spawn evidence or skip reason', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-delegation-evidence-'));
+    try {
+      await initTeamState('team-delegation-evidence', 't', 'executor', 1, cwd);
+      const t = await createTask('team-delegation-evidence', {
+        subject: 'Investigate flaky runtime behavior',
+        description: 'Search runtime and debug flaky assignment behavior',
+        status: 'pending',
+        delegation: {
+          mode: 'auto',
+          required_parallel_probe: true,
+          skip_allowed_reason_required: true,
+        },
+      }, cwd);
+      const claim = await claimTask('team-delegation-evidence', t.id, 'worker-1', t.version ?? 1, cwd);
+      assert.equal(claim.ok, true);
+      if (!claim.ok) return;
+
+      const missing = await transitionTaskStatus(
+        'team-delegation-evidence',
+        t.id,
+        'in_progress',
+        'completed',
+        claim.claimToken,
+        cwd,
+        { result: 'Verification:\nPASS - focused regression' },
+      );
+
+      assert.equal(missing.ok, false);
+      assert.equal(missing.ok ? 'x' : missing.error, 'missing_delegation_compliance_evidence');
+      const reread = await readTask('team-delegation-evidence', t.id, cwd);
+      assert.equal(reread?.status, 'in_progress');
+
+      const completedWithSpawnEvidence = await transitionTaskStatus(
+        'team-delegation-evidence',
+        t.id,
+        'in_progress',
+        'completed',
+        claim.claimToken,
+        cwd,
+        {
+          result: [
+            'Verification:',
+            'PASS - focused regression',
+            'Subagent spawn evidence: spawned 2 native subagents for runtime map and test probe',
+          ].join('\n'),
+        },
+      );
+      assert.equal(completedWithSpawnEvidence.ok, true);
+      assert.equal(completedWithSpawnEvidence.task.delegation_compliance?.status, 'spawned');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('transitionTaskStatus requires evidence when optional delegation carries required parallel probe', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-optional-required-probe-'));
+    try {
+      await initTeamState('team-optional-required-probe', 't', 'executor', 1, cwd);
+      const t = await createTask('team-optional-required-probe', {
+        subject: 'Investigate optional delegated runtime behavior',
+        description: 'Optional mode was elevated by a required parallel probe from review enforcement',
+        status: 'pending',
+        delegation: {
+          mode: 'optional',
+          required_parallel_probe: true,
+          skip_allowed_reason_required: true,
+        },
+      }, cwd);
+      const claim = await claimTask('team-optional-required-probe', t.id, 'worker-1', t.version ?? 1, cwd);
+      assert.equal(claim.ok, true);
+      if (!claim.ok) return;
+
+      const missing = await transitionTaskStatus(
+        'team-optional-required-probe',
+        t.id,
+        'in_progress',
+        'completed',
+        claim.claimToken,
+        cwd,
+        { result: 'Verification:\nPASS - focused regression' },
+      );
+
+      assert.equal(missing.ok, false);
+      assert.equal(missing.ok ? 'x' : missing.error, 'missing_delegation_compliance_evidence');
+      const reread = await readTask('team-optional-required-probe', t.id, cwd);
+      assert.equal(reread?.status, 'in_progress');
+
+      const completed = await transitionTaskStatus(
+        'team-optional-required-probe',
+        t.id,
+        'in_progress',
+        'completed',
+        claim.claimToken,
+        cwd,
+        {
+          result: [
+            'Verification:',
+            'PASS - focused regression',
+            'Subagent spawn evidence: spawned 1 native subagent for delegation evidence regression mapping',
+          ].join('\n'),
+        },
+      );
+
+      assert.equal(completed.ok, true);
+      assert.equal(completed.task.delegation_compliance?.status, 'spawned');
+      assert.equal(completed.task.delegation_compliance?.source, 'terminal_result');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('transitionTaskStatus accepts documented skip reason for broad delegated completion', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-delegation-skip-'));
+    try {
+      await initTeamState('team-delegation-skip', 't', 'executor', 1, cwd);
+      const t = await createTask('team-delegation-skip', {
+        subject: 'Review focused regression',
+        description: 'Audit one already-isolated failing test',
+        status: 'pending',
+        delegation: {
+          mode: 'auto',
+          required_parallel_probe: true,
+          skip_allowed_reason_required: true,
+        },
+      }, cwd);
+      const claim = await claimTask('team-delegation-skip', t.id, 'worker-1', t.version ?? 1, cwd);
+      assert.equal(claim.ok, true);
+      if (!claim.ok) return;
+
+      const completed = await transitionTaskStatus(
+        'team-delegation-skip',
+        t.id,
+        'in_progress',
+        'completed',
+        claim.claimToken,
+        cwd,
+        {
+          result: [
+            'Verification:',
+            'PASS - focused regression',
+            'Subagent skip reason: task scope collapsed to one isolated assertion; spawning would duplicate serial verification',
+          ].join('\n'),
+        },
+      );
+
+      assert.equal(completed.ok, true);
+      assert.equal(completed.task.delegation_compliance?.status, 'skipped');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('transitionTaskStatus rejects coordinated completion without boundary evidence', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-coordination-evidence-'));
+    try {
+      await initTeamState('team-coordination-evidence', 't', 'executor', 1, cwd);
+      const t = await createTask('team-coordination-evidence', {
+        subject: 'Integrate shared runtime and tests',
+        description: 'Coordinate a handoff across shared runtime boundaries.',
+        status: 'pending',
+        coordination: {
+          mode: 'coordinated',
+          activation_reasons: ['cross_boundary_or_handoff_language'],
+          required_mechanisms: ['shared_mental_model', 'closed_loop_communication'],
+        },
+      }, cwd);
+      const claim = await claimTask('team-coordination-evidence', t.id, 'worker-1', t.version ?? 1, cwd);
+      assert.equal(claim.ok, true);
+      if (!claim.ok) return;
+
+      const missing = await transitionTaskStatus(
+        'team-coordination-evidence',
+        t.id,
+        'in_progress',
+        'completed',
+        claim.claimToken,
+        cwd,
+        { result: 'Verification:\nPASS - focused regression' },
+      );
+
+      assert.equal(missing.ok, false);
+      assert.equal(missing.ok ? 'x' : missing.error, 'missing_coordination_compliance_evidence');
+
+      const completed = await transitionTaskStatus(
+        'team-coordination-evidence',
+        t.id,
+        'in_progress',
+        'completed',
+        claim.claimToken,
+        cwd,
+        {
+          result: [
+            'Verification:',
+            'PASS - focused regression',
+            'Coordination protocol: coordinated - shared runtime handoff and downstream boundary checks verified',
+          ].join('\n'),
+        },
+      );
+
+      assert.equal(completed.ok, true);
+      assert.equal(completed.task.coordination_compliance?.status, 'checked');
+      assert.equal(completed.task.coordination_compliance?.source, 'terminal_result');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('transitionTaskStatus accepts documented no-boundary rationale for coordinated tasks', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-coordination-no-boundary-'));
+    try {
+      await initTeamState('team-coordination-no-boundary', 't', 'executor', 1, cwd);
+      const t = await createTask('team-coordination-no-boundary', {
+        subject: 'Coordinate shared verification',
+        description: 'Original plan had a handoff, but implementation collapsed to one isolated check.',
+        status: 'pending',
+        coordination: {
+          mode: 'coordinated',
+          activation_reasons: ['cross_boundary_or_handoff_language'],
+        },
+      }, cwd);
+      const claim = await claimTask('team-coordination-no-boundary', t.id, 'worker-1', t.version ?? 1, cwd);
+      assert.equal(claim.ok, true);
+      if (!claim.ok) return;
+
+      const completed = await transitionTaskStatus(
+        'team-coordination-no-boundary',
+        t.id,
+        'in_progress',
+        'completed',
+        claim.claimToken,
+        cwd,
+        {
+          result: [
+            'Verification:',
+            'PASS - focused regression',
+            'Coordination protocol: no boundary handoff - scope collapsed before execution; no peer-facing artifact changed',
+          ].join('\n'),
+        },
+      );
+
+      assert.equal(completed.ok, true);
+      assert.equal(completed.task.coordination_compliance?.status, 'no_boundary_handoff');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -1235,6 +1506,15 @@ exit 1
       const compat = JSON.parse(await readFile(compatPath, 'utf8')) as { records: Array<{ message_id: string; body: string }> };
       const compatRecord = compat.records.find((entry) => entry.message_id === message.message_id);
       assert.ok(compatRecord);
+
+      const runtimeLogBefore = await readFile(runtimeLogPath, 'utf8');
+      const deliveredCallsBefore = runtimeLogBefore.split('MarkMailboxDelivered').length - 1;
+      const deliveredAgain = await markMessageDelivered('team-mailbox-bridge-authority', 'worker-2', message.message_id, cwd);
+      assert.equal(deliveredAgain, true, 'already-delivered bridge message should be treated as delivered');
+      const runtimeLogAfter = await readFile(runtimeLogPath, 'utf8');
+      const deliveredCallsAfter = runtimeLogAfter.split('MarkMailboxDelivered').length - 1;
+      assert.equal(deliveredCallsAfter, deliveredCallsBefore, 'idempotent delivered calls should not invoke bridge a second time');
+
       compatRecord!.body = '';
       await writeFile(compatPath, JSON.stringify(compat, null, 2));
 
@@ -1458,6 +1738,38 @@ exit 1
 
       const t2 = await createTask('team-legacy', { subject: 'b', description: 'd', status: 'pending' }, cwd);
       assert.equal(t2.id, '2');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('createTask does not overwrite existing tasks when manifest/config next_task_id lags disk', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-state-'));
+    try {
+      await initTeamState('team-stale-next-id', 't', 'executor', 1, cwd);
+
+      const first = await createTask('team-stale-next-id', { subject: 'first', description: 'd', status: 'pending' }, cwd);
+      assert.equal(first.id, '1');
+
+      const teamRoot = join(cwd, '.omx', 'state', 'team', 'team-stale-next-id');
+      const configPath = join(teamRoot, 'config.json');
+      const manifestPath = join(teamRoot, 'manifest.v2.json');
+
+      const config = JSON.parse(readFileSync(configPath, 'utf8')) as Record<string, unknown>;
+      config.next_task_id = 1;
+      await writeAtomic(configPath, JSON.stringify(config, null, 2));
+
+      const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>;
+      manifest.next_task_id = 1;
+      await writeAtomic(manifestPath, JSON.stringify(manifest, null, 2));
+
+      const second = await createTask('team-stale-next-id', { subject: 'second', description: 'd', status: 'pending' }, cwd);
+      assert.equal(second.id, '2');
+
+      const firstTask = JSON.parse(await readFile(join(teamRoot, 'tasks', 'task-1.json'), 'utf8')) as { subject?: string };
+      const secondTask = JSON.parse(await readFile(join(teamRoot, 'tasks', 'task-2.json'), 'utf8')) as { subject?: string };
+      assert.equal(firstTask.subject, 'first');
+      assert.equal(secondTask.subject, 'second');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -1837,6 +2149,21 @@ exit 1
     }
   });
 
+
+  it('cleanupTeamState rejects unsafe team names before path construction', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-state-unsafe-'));
+    try {
+      const victim = join(cwd, '.omx', 'state', 'victim');
+      await mkdir(victim, { recursive: true });
+      await writeFile(join(victim, 'keep.txt'), 'keep');
+
+      await assert.rejects(() => cleanupTeamState('../victim', cwd), /invalid_team_name/);
+      assert.equal(existsSync(join(victim, 'keep.txt')), true);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('validateTeamName rejects invalid names (via initTeamState throwing)', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-state-'));
     try {
@@ -1975,6 +2302,99 @@ exit 1
         }
         await rm(lockDir, { recursive: true, force: true });
       }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('treats dispatch status as authoritative over incompatible timestamps', () => {
+    const pending = normalizeDispatchRequest('team-contract-dispatch', {
+      kind: 'inbox',
+      to_worker: 'worker-1',
+      trigger_message: 'ping',
+      status: 'pending',
+      notified_at: '2026-04-04T00:00:00.000Z',
+      delivered_at: '2026-04-04T00:01:00.000Z',
+      failed_at: '2026-04-04T00:02:00.000Z',
+    });
+    assert.equal(pending?.status, 'pending');
+    assert.equal(pending?.notified_at, undefined);
+    assert.equal(pending?.delivered_at, undefined);
+    assert.equal(pending?.failed_at, undefined);
+
+    const notified = normalizeDispatchRequest('team-contract-dispatch', {
+      kind: 'inbox',
+      to_worker: 'worker-1',
+      trigger_message: 'ping',
+      status: 'notified',
+      notified_at: '2026-04-04T00:00:00.000Z',
+      delivered_at: '2026-04-04T00:01:00.000Z',
+      failed_at: '2026-04-04T00:02:00.000Z',
+    });
+    assert.equal(notified?.status, 'notified');
+    assert.equal(notified?.notified_at, '2026-04-04T00:00:00.000Z');
+    assert.equal(notified?.delivered_at, undefined);
+    assert.equal(notified?.failed_at, undefined);
+
+    const delivered = normalizeDispatchRequest('team-contract-dispatch', {
+      kind: 'inbox',
+      to_worker: 'worker-1',
+      trigger_message: 'ping',
+      status: 'delivered',
+      notified_at: '2026-04-04T00:00:00.000Z',
+      delivered_at: '2026-04-04T00:01:00.000Z',
+      failed_at: '2026-04-04T00:02:00.000Z',
+    });
+    assert.equal(delivered?.status, 'delivered');
+    assert.equal(delivered?.notified_at, '2026-04-04T00:00:00.000Z');
+    assert.equal(delivered?.delivered_at, '2026-04-04T00:01:00.000Z');
+    assert.equal(delivered?.failed_at, undefined);
+
+    const failed = normalizeDispatchRequest('team-contract-dispatch', {
+      kind: 'inbox',
+      to_worker: 'worker-1',
+      trigger_message: 'ping',
+      status: 'failed',
+      notified_at: '2026-04-04T00:00:00.000Z',
+      delivered_at: '2026-04-04T00:01:00.000Z',
+      failed_at: '2026-04-04T00:02:00.000Z',
+    });
+    assert.equal(failed?.status, 'failed');
+    assert.equal(failed?.notified_at, '2026-04-04T00:00:00.000Z');
+    assert.equal(failed?.delivered_at, undefined);
+    assert.equal(failed?.failed_at, '2026-04-04T00:02:00.000Z');
+  });
+
+  it('sanitizes persisted integration snapshot statuses to the contract', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-monitor-contract-'));
+    try {
+      await initTeamState('team-monitor-contract', 't', 'executor', 1, cwd);
+      const monitorPath = join(cwd, '.omx', 'state', 'team', 'team-monitor-contract', 'monitor-snapshot.json');
+      await writeFile(monitorPath, JSON.stringify({
+        taskStatusById: {},
+        workerAliveByName: {},
+        workerStateByName: {},
+        workerTurnCountByName: {},
+        workerTaskIdByName: {},
+        mailboxNotifiedByMessageId: {},
+        completedEventTaskIds: {},
+        integrationByWorker: {
+          'worker-1': {
+            status: 'integrated',
+            last_integrated_head: 'abc123',
+          },
+          'worker-2': {
+            status: 'mystery_state',
+            last_integrated_head: 'def456',
+          },
+        },
+      }, null, 2));
+
+      const snapshot = await readMonitorSnapshot('team-monitor-contract', cwd);
+      assert.equal(snapshot?.integrationByWorker?.['worker-1']?.status, 'integrated');
+      assert.equal(snapshot?.integrationByWorker?.['worker-1']?.last_integrated_head, 'abc123');
+      assert.equal(snapshot?.integrationByWorker?.['worker-2']?.status, undefined);
+      assert.equal(snapshot?.integrationByWorker?.['worker-2']?.last_integrated_head, 'def456');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

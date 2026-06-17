@@ -5,8 +5,33 @@
 /** Ralph loop state for HUD display */
 export interface RalphStateForHud {
   active: boolean;
-  iteration: number;
-  max_iterations: number;
+  iteration?: number;
+  max_iterations?: number;
+}
+
+/** Ultragoal durable goal-plan state for HUD display */
+export interface UltragoalActiveGoalForHud {
+  id: string;
+  title: string;
+  objective: string;
+  status: string;
+  index: number;
+}
+
+export interface UltragoalStateForHud {
+  active: boolean;
+  status?: string;
+  total: number;
+  complete: number;
+  pending: number;
+  inProgress: number;
+  failed: number;
+  reviewBlocked: number;
+  needsUserDecision: number;
+  progressTotal: number;
+  activeGoal?: UltragoalActiveGoalForHud;
+  ongoingGoals?: UltragoalActiveGoalForHud[];
+  nextGoals?: UltragoalActiveGoalForHud[];
 }
 
 /** Ultrawork state for HUD display */
@@ -42,10 +67,22 @@ export interface AutoresearchStateForHud {
   current_phase?: string;
 }
 
+export type LateGateHudSource = 'canonical-skill' | 'autopilot';
+
+/** Code-review state for HUD display */
+export interface CodeReviewStateForHud {
+  active: boolean;
+  current_phase?: string;
+  /** Authority that produced this HUD-only status. */
+  source?: LateGateHudSource;
+}
+
 /** Ultraqa state for HUD display */
 export interface UltraqaStateForHud {
   active: boolean;
   current_phase?: string;
+  /** Authority that produced this derived/fallback HUD status. */
+  source?: LateGateHudSource;
 }
 
 /** Team state for HUD display */
@@ -86,11 +123,13 @@ export interface HudRenderContext {
   version: string | null;
   gitBranch: string | null;
   ralph: RalphStateForHud | null;
+  ultragoal?: UltragoalStateForHud | null;
   ultrawork: UltraworkStateForHud | null;
   autopilot: AutopilotStateForHud | null;
   ralplan: RalplanStateForHud | null;
   deepInterview: DeepInterviewStateForHud | null;
   autoresearch: AutoresearchStateForHud | null;
+  codeReview?: CodeReviewStateForHud | null;
   ultraqa: UltraqaStateForHud | null;
   team: TeamStateForHud | null;
   metrics: HudMetrics | null;
@@ -111,10 +150,16 @@ export interface HudGitConfig {
   repoLabel?: string;
 }
 
+/** Status line preset configuration (drives [tui].status_line in ~/.codex/config.toml) */
+export interface HudStatusLineConfig {
+  preset?: HudPreset;
+}
+
 /** HUD configuration stored in .omx/hud-config.json */
 export interface HudConfig {
   preset?: HudPreset;
   git?: HudGitConfig;
+  statusLine?: HudStatusLineConfig;
 }
 
 export interface ResolvedHudGitConfig {
@@ -123,9 +168,14 @@ export interface ResolvedHudGitConfig {
   repoLabel?: string;
 }
 
+export interface ResolvedHudStatusLineConfig {
+  preset: HudPreset;
+}
+
 export interface ResolvedHudConfig {
   preset: HudPreset;
   git: ResolvedHudGitConfig;
+  statusLine: ResolvedHudStatusLineConfig;
 }
 
 /** Default HUD configuration */
@@ -133,6 +183,9 @@ export const DEFAULT_HUD_CONFIG: ResolvedHudConfig = {
   preset: 'focused',
   git: {
     display: 'repo-branch',
+  },
+  statusLine: {
+    preset: 'focused',
   },
 };
 

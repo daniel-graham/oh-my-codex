@@ -2,8 +2,10 @@ import { existsSync } from 'fs';
 import { mkdir, readFile, writeFile } from 'fs/promises';
 import { spawnSync } from 'child_process';
 import { join } from 'path';
+import { omxRoot } from '../utils/paths.js';
 import { getPackageRoot } from '../utils/package.js';
 import { resolveCodexPane } from '../scripts/tmux-hook-engine.js';
+import { resolveTmuxBinaryForPlatform } from '../utils/platform-command.js';
 
 type TmuxTargetType = 'session' | 'pane';
 
@@ -89,7 +91,7 @@ export async function tmuxHookCommand(args: string[]): Promise<void> {
 }
 
 function omxDir(cwd = process.cwd()): string {
-  return join(cwd, '.omx');
+  return omxRoot(cwd);
 }
 
 function tmuxHookConfigPath(cwd = process.cwd()): string {
@@ -207,7 +209,7 @@ async function loadConfigForCommand(
 }
 
 function runTmux(args: string[]): { ok: true; stdout: string } | { ok: false; stderr: string } {
-  const result = spawnSync('tmux', args, { encoding: 'utf-8',
+  const result = spawnSync(resolveTmuxBinaryForPlatform() || 'tmux', args, { encoding: 'utf-8',
       windowsHide: true,
     });
   if (result.error) {
@@ -278,6 +280,23 @@ function detectInitialTarget(): InitialTargetDetection | null {
         sessionName: session.ok && session.stdout ? session.stdout : undefined,
       };
     }
+  }
+
+  const envPane = process.env.TMUX && typeof process.env.TMUX_PANE === 'string'
+    ? process.env.TMUX_PANE.trim()
+    : '';
+  if (envPane) {
+    const pane = runTmux(['display-message', '-p', '-t', envPane, '#{pane_id}']);
+    if (pane.ok && pane.stdout) {
+      const session = runTmux(['display-message', '-p', '-t', envPane, '#S']);
+      return {
+        target: { type: 'pane', value: pane.stdout },
+        sessionName: session.ok && session.stdout ? session.stdout : undefined,
+      };
+    }
+    return {
+      target: { type: 'pane', value: envPane },
+    };
   }
 
   const currentClientPane = runTmux(['display-message', '-p', '#{pane_id}']);

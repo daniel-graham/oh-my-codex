@@ -12,6 +12,10 @@ import {
   getIdleNotificationCooldownSeconds,
   shouldSendIdleNotification,
   recordIdleNotificationSent,
+  shouldSendSessionIdleHookEvent,
+  recordSessionIdleHookEventSent,
+  shouldIncludeSessionIdleTmuxTail,
+  recordSessionIdleTmuxTailSent,
 } from '../idle-cooldown.js';
 
 function makeTmpStateDir(): string {
@@ -200,5 +204,85 @@ describe('recordIdleNotificationSent', () => {
     const content = JSON.parse(readFileSync(sessionFile, 'utf-8')) as { lastSentAt: string; fingerprint?: string };
     assert.equal(content.fingerprint, fingerprint);
     assert.equal(typeof content.lastSentAt, 'string');
+  });
+});
+
+describe('session-idle hook event dedupe', () => {
+  let stateDir: string;
+
+  beforeEach(() => {
+    stateDir = makeTmpStateDir();
+    delete process.env.OMX_IDLE_COOLDOWN_SECONDS;
+  });
+
+  afterEach(() => {
+    rmSync(stateDir, { recursive: true, force: true });
+    delete process.env.OMX_IDLE_COOLDOWN_SECONDS;
+  });
+
+  it('suppresses unchanged hook fingerprints even when lifecycle cooldown is disabled', () => {
+    process.env.OMX_IDLE_COOLDOWN_SECONDS = '0';
+    const sessionId = 'test-session-hook-zero-cooldown';
+    const fingerprint = '{"phase":"idle","summary":"Waiting for input"}';
+
+    recordSessionIdleHookEventSent(stateDir, sessionId, fingerprint);
+
+    assert.equal(shouldSendSessionIdleHookEvent(stateDir, sessionId, fingerprint), false);
+  });
+
+  it('re-emits when the hook fingerprint changes', () => {
+    const sessionId = 'test-session-hook-change';
+    recordSessionIdleHookEventSent(stateDir, sessionId, '{"phase":"idle","summary":"Waiting on review"}');
+
+    assert.equal(
+      shouldSendSessionIdleHookEvent(stateDir, sessionId, '{"phase":"idle","summary":"Waiting on user input"}'),
+      true,
+    );
+  });
+});
+
+describe('session-idle tmux tail dedupe', () => {
+  let stateDir: string;
+
+  beforeEach(() => {
+    stateDir = makeTmpStateDir();
+  });
+
+  afterEach(() => {
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  it('suppresses unchanged parsed tmux tails for repeated idle notifications', () => {
+    const sessionId = 'test-session-idle-tmux-tail';
+    const fingerprint = 'Waiting on review';
+
+    recordSessionIdleTmuxTailSent(stateDir, sessionId, fingerprint);
+
+    assert.equal(shouldIncludeSessionIdleTmuxTail(stateDir, sessionId, fingerprint), false);
+  });
+
+  it('allows newly changed tmux tails to be included immediately', () => {
+    const sessionId = 'test-session-idle-tmux-tail-change';
+    recordSessionIdleTmuxTailSent(stateDir, sessionId, 'Waiting on review');
+
+    assert.equal(shouldIncludeSessionIdleTmuxTail(stateDir, sessionId, 'Fresh setup error'), true);
+  });
+
+  it('treats empty tmux tails as nothing to resend', () => {
+    const sessionId = 'test-session-idle-tmux-tail-empty';
+
+    assert.equal(shouldIncludeSessionIdleTmuxTail(stateDir, sessionId, ''), false);
+  });
+
+  it('keeps lifecycle fingerprint and tmux-tail fingerprint independently', () => {
+    const sessionId = 'test-session-idle-tmux-tail-independent';
+    recordIdleNotificationSent(stateDir, sessionId, '{"phase":"idle","summary":"Waiting on review"}');
+    recordSessionIdleTmuxTailSent(stateDir, sessionId, 'Waiting on review');
+
+    assert.equal(
+      shouldSendIdleNotification(stateDir, sessionId, '{"phase":"idle","summary":"Waiting on user input"}'),
+      true,
+    );
+    assert.equal(shouldIncludeSessionIdleTmuxTail(stateDir, sessionId, 'Waiting on review'), false);
   });
 });
